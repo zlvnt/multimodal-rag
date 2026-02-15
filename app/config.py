@@ -9,6 +9,9 @@ class Settings(BaseSettings):
     chroma_dir: str = "storage/chroma"
     chroma_collection: str = "multimodal_rag"
 
+    chunk_size: int = 512
+    chunk_overlap: int = 50
+
     model_config = {"env_file": ".env"}
 
 
