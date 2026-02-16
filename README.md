@@ -1,10 +1,10 @@
 # Multimodal RAG
 
-A Retrieval-Augmented Generation (RAG) system that supports **images** and **PDFs** as knowledge sources.
+A Retrieval-Augmented Generation (RAG) system that supports **images** and **documents** (PDF, Word, Markdown, plain text) as knowledge sources.
 
 **Flow:**
 - **Image**: Gemini describe image → Jina embed text → store in ChromaDB
-- **PDF**: PyMuPDF extract text → chunk → Jina embed → store in ChromaDB
+- **Document** (`.pdf`, `.docx`, `.md`, `.txt`): extract text → chunk → Jina embed → store in ChromaDB
 - **Query**: Jina embed query → ChromaDB search → Gemini generate answer
 
 ## Prerequisites
@@ -44,7 +44,7 @@ Follow the step-by-step guide in the notebook:
 
 1. **Setup** — load config & engine
 2. **Ingest images** — place images in `data/images/`, run the ingest cell
-3. **Ingest PDFs** — place PDFs in `data/pdfs/`, run the ingest cell
+3. **Ingest documents** — place documents (PDF, Word, Markdown, TXT) in `data/docs/`, run the ingest cell
 4. **Query** — ask questions based on ingested documents
 5. **Utils** — list documents, delete, or reset DB
 
@@ -57,7 +57,7 @@ multimodal-rag/
 │   └── engine.py          # Core: embed, ingest, query, describe
 ├── data/
 │   ├── images/            # Place images here
-│   └── pdfs/              # Place PDFs here
+│   └── docs/              # Place documents here (PDF, Word, Markdown, TXT)
 ├── storage/               # ChromaDB data (auto-generated)
 ├── notebook.ipynb         # Main notebook
 ├── requirements.txt

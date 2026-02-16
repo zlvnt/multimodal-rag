@@ -6,4 +6,5 @@ chromadb
 requests
 google-genai
 pymupdf
+python-docx
 jupyter

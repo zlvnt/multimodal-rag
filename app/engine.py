@@ -5,6 +5,7 @@ import uuid
 from typing import List
 
 import chromadb
+import docx
 import fitz
 import requests
 from google import genai
@@ -92,6 +93,38 @@ def extract_pdf_text(file_path: str) -> str:
         text_parts.append(page.get_text())
     doc.close()
     return "\n".join(text_parts)
+
+
+def extract_docx_text(file_path: str) -> str:
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"File DOCX tidak ditemukan: {file_path}")
+
+    try:
+        doc = docx.Document(file_path)
+    except Exception as e:
+        raise RuntimeError(f"Gagal membuka DOCX (file mungkin corrupt): {e}")
+
+    return "\n".join(p.text for p in doc.paragraphs)
+
+
+def extract_file_text(file_path: str) -> str:
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"File tidak ditemukan: {file_path}")
+
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext == ".pdf":
+        return extract_pdf_text(file_path)
+    elif ext == ".docx":
+        return extract_docx_text(file_path)
+    elif ext in (".md", ".txt"):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                return f.read()
+        except Exception as e:
+            raise RuntimeError(f"Gagal membaca file {ext}: {e}")
+    else:
+        raise ValueError(f"Format file tidak didukung: {ext}. Gunakan .pdf, .docx, .md, atau .txt")
 
 
 def chunk_text(text: str, chunk_size: int = None, overlap: int = None) -> List[str]:
