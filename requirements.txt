@@ -2,10 +2,8 @@ pydantic==2.11.7
 pydantic-settings==2.10.1
 python-dotenv==1.0.1
 
-llama-index-embeddings-jinaai
-llama-index-vector-stores-chroma
 chromadb
-
+requests
 google-genai
 pymupdf
 jupyter

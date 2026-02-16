@@ -1,24 +1,25 @@
 import base64
 import os
+import uuid
 from typing import List
 
 import chromadb
 import fitz
+import requests
 from google import genai
-from llama_index.embeddings.jinaai import JinaEmbedding
-from llama_index.vector_stores.chroma import ChromaVectorStore
-from llama_index.core import StorageContext, VectorStoreIndex
-from llama_index.core.schema import TextNode
-from llama_index.core.vector_stores import VectorStoreQuery
 
 from app.config import settings
 
 
-def get_embed_model() -> JinaEmbedding:
-    return JinaEmbedding(
-        api_key=settings.jina_api_key,
-        model="jina-embeddings-v4",
+def get_embeddings(texts: List[str]) -> List[List[float]]:
+    response = requests.post(
+        "https://api.jina.ai/v1/embeddings",
+        headers={"Authorization": f"Bearer {settings.jina_api_key}"},
+        json={"model": "jina-embeddings-v4", "input": texts},
     )
+    response.raise_for_status()
+    data = response.json()["data"]
+    return [item["embedding"] for item in data]
 
 
 def get_gemini_client() -> genai.Client:
@@ -27,21 +28,9 @@ def get_gemini_client() -> genai.Client:
 
 def get_chroma_collection() -> chromadb.Collection:
     client = chromadb.PersistentClient(path=settings.chroma_dir)
-    return client.get_or_create_collection(settings.chroma_collection)
-
-
-def get_vector_store() -> ChromaVectorStore:
-    collection = get_chroma_collection()
-    return ChromaVectorStore(chroma_collection=collection)
-
-
-def get_index() -> VectorStoreIndex:
-    vector_store = get_vector_store()
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
-    return VectorStoreIndex.from_vector_store(
-        vector_store=vector_store,
-        storage_context=storage_context,
-        embed_model=get_embed_model(),
+    return client.get_or_create_collection(
+        settings.chroma_collection,
+        metadata={"hnsw:space": "cosine"},
     )
 
 
@@ -59,7 +48,7 @@ def describe_image(file_path: str) -> str:
         contents=[
             {
                 "parts": [
-                    {"text": "Describe this image in detail. Include all visible objects, text, colors, layout, and any other relevant information."},
+                    {"text": "Describe this image for use in a RAG (Retrieval-Augmented Generation) system. Focus on the key information, concepts, and facts presented. Avoid describing visual styling like colors, fonts, or layout. Be concise and informative."},
                     {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode()}},
                 ]
             }
@@ -83,64 +72,98 @@ def chunk_text(text: str, chunk_size: int = None, overlap: int = None) -> List[s
     if overlap is None:
         overlap = settings.chunk_overlap
 
+    separators = ["\n\n", "\n", " ", ""]
+    chunks = _recursive_split(text, separators, chunk_size)
+
+    # Tambah overlap antar chunks (sekali aja, di sini)
+    if overlap > 0 and len(chunks) > 1:
+        overlapped = [chunks[0]]
+        for i in range(1, len(chunks)):
+            prev = chunks[i - 1]
+            overlap_text = prev[-overlap:] if len(prev) >= overlap else prev
+            overlapped.append(overlap_text + chunks[i])
+        chunks = overlapped
+
+    return chunks
+
+
+def _recursive_split(text: str, separators: List[str], chunk_size: int) -> List[str]:
     if len(text) <= chunk_size:
         return [text]
 
+    # Cari separator yang cocok
+    sep = separators[-1]
+    for s in separators:
+        if s in text:
+            sep = s
+            break
+
+    parts = text.split(sep) if sep else list(text)
+
     chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
-        start = end - overlap
+    current = ""
+
+    for part in parts:
+        # Tambah separator kecuali kosong
+        candidate = current + sep + part if current else part
+
+        if len(candidate) <= chunk_size:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            # Kalau part sendiri masih kegedean, split lagi pakai separator berikutnya
+            if len(part) > chunk_size:
+                remaining_seps = separators[separators.index(sep) + 1:]
+                if remaining_seps:
+                    chunks.extend(_recursive_split(part, remaining_seps, chunk_size))
+                else:
+                    chunks.append(part)
+                current = ""
+            else:
+                current = part
+
+    if current:
+        chunks.append(current)
+
     return chunks
 
 
 def ingest_texts(texts: List[str], metadatas: List[dict] = None) -> List[str]:
-    embed_model = get_embed_model()
-    vector_store = get_vector_store()
+    embeddings = get_embeddings(texts)
+    collection = get_chroma_collection()
 
-    import uuid
-    nodes = []
-    ids = []
-    for i, text in enumerate(texts):
-        embedding = embed_model.get_text_embedding(text)
-        node_id = str(uuid.uuid4())
-        meta = metadatas[i] if metadatas else {}
-        node = TextNode(
-            text=text,
-            id_=node_id,
-            embedding=embedding,
-            metadata=meta,
-        )
-        nodes.append(node)
-        ids.append(node_id)
+    ids = [str(uuid.uuid4()) for _ in texts]
+    metas = metadatas if metadatas else [{} for _ in texts]
 
-    vector_store.add(nodes=nodes)
+    collection.add(
+        ids=ids,
+        documents=texts,
+        embeddings=embeddings,
+        metadatas=metas,
+    )
     return ids
 
 
 def query_rag(query: str, top_k: int = 3) -> dict:
-    embed_model = get_embed_model()
-    query_embedding = embed_model.get_text_embedding(query)
+    query_embedding = get_embeddings([query])[0]
 
-    vector_store = get_vector_store()
-    result = vector_store.query(
-        VectorStoreQuery(
-            query_embedding=query_embedding,
-            similarity_top_k=top_k,
-        )
+    collection = get_chroma_collection()
+    result = collection.query(
+        query_embeddings=[query_embedding],
+        n_results=top_k,
     )
 
-    contexts = []
+    contexts = result["documents"][0]
     sources = []
-    for i, node in enumerate(result.nodes):
-        contexts.append(node.text)
-        score = result.similarities[i] if result.similarities and i < len(result.similarities) else None
+    for i in range(len(contexts)):
+        score = result["distances"][0][i] if result["distances"] else None
+        meta = result["metadatas"][0][i] if result["metadatas"] else {}
         sources.append({
-            "id": node.id_,
+            "id": result["ids"][0][i],
             "score": score,
-            "metadata": node.metadata,
-            "text_preview": node.text[:200],
+            "metadata": meta,
+            "text_preview": contexts[i][:200],
         })
 
     context_str = "\n\n---\n\n".join(contexts)
