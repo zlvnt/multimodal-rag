@@ -1,4 +1,5 @@
 import base64
+import logging
 import os
 import uuid
 from typing import List
@@ -10,16 +11,27 @@ from google import genai
 
 from app.config import settings
 
+logger = logging.getLogger(__name__)
+
 
 def get_embeddings(texts: List[str]) -> List[List[float]]:
-    response = requests.post(
-        "https://api.jina.ai/v1/embeddings",
-        headers={"Authorization": f"Bearer {settings.jina_api_key}"},
-        json={"model": "jina-embeddings-v4", "input": texts},
-    )
-    response.raise_for_status()
-    data = response.json()["data"]
-    return [item["embedding"] for item in data]
+    try:
+        response = requests.post(
+            "https://api.jina.ai/v1/embeddings",
+            headers={"Authorization": f"Bearer {settings.jina_api_key}"},
+            json={"model": "jina-embeddings-v4", "input": texts},
+        )
+        response.raise_for_status()
+        data = response.json()["data"]
+        return [item["embedding"] for item in data]
+    except requests.ConnectionError:
+        raise RuntimeError("Gagal koneksi ke Jina API. Cek koneksi internet.")
+    except requests.Timeout:
+        raise RuntimeError("Request ke Jina API timeout. Coba lagi nanti.")
+    except requests.HTTPError as e:
+        raise RuntimeError(f"Jina API error (HTTP {e.response.status_code}): {e.response.text}")
+    except requests.RequestException as e:
+        raise RuntimeError(f"Gagal mendapatkan embeddings dari Jina API: {e}")
 
 
 def get_gemini_client() -> genai.Client:
@@ -35,6 +47,9 @@ def get_chroma_collection() -> chromadb.Collection:
 
 
 def describe_image(file_path: str) -> str:
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"File gambar tidak ditemukan: {file_path}")
+
     client = get_gemini_client()
     with open(file_path, "rb") as f:
         image_bytes = f.read()
@@ -43,22 +58,32 @@ def describe_image(file_path: str) -> str:
     mime_map = {".png": "image/png", ".webp": "image/webp", ".gif": "image/gif"}
     mime_type = mime_map.get(ext, "image/jpeg")
 
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[
-            {
-                "parts": [
-                    {"text": "Describe this image for use in a RAG (Retrieval-Augmented Generation) system. Focus on the key information, concepts, and facts presented. Avoid describing visual styling like colors, fonts, or layout. Be concise and informative."},
-                    {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode()}},
-                ]
-            }
-        ],
-    )
-    return response.text
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                {
+                    "parts": [
+                        {"text": "Describe this image for use in a RAG (Retrieval-Augmented Generation) system. Focus on the key information, concepts, and facts presented. Avoid describing visual styling like colors, fonts, or layout. Be concise and informative."},
+                        {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode()}},
+                    ]
+                }
+            ],
+        )
+        return response.text
+    except Exception as e:
+        raise RuntimeError(f"Gagal describe image via Gemini: {e}")
 
 
 def extract_pdf_text(file_path: str) -> str:
-    doc = fitz.open(file_path)
+    if not os.path.isfile(file_path):
+        raise FileNotFoundError(f"File PDF tidak ditemukan: {file_path}")
+
+    try:
+        doc = fitz.open(file_path)
+    except Exception as e:
+        raise RuntimeError(f"Gagal membuka PDF (file mungkin corrupt): {e}")
+
     text_parts = []
     for page in doc:
         text_parts.append(page.get_text())
@@ -129,12 +154,33 @@ def _recursive_split(text: str, separators: List[str], chunk_size: int) -> List[
     return chunks
 
 
-def ingest_texts(texts: List[str], metadatas: List[dict] = None) -> List[str]:
-    embeddings = get_embeddings(texts)
+def ingest_texts(texts: List[str], metadatas: List[dict] = None, force: bool = False) -> List[str]:
     collection = get_chroma_collection()
-
-    ids = [str(uuid.uuid4()) for _ in texts]
     metas = metadatas if metadatas else [{} for _ in texts]
+
+    # Duplikasi check berdasarkan metadata "source"
+    if not force:
+        filtered_texts = []
+        filtered_metas = []
+        for text, meta in zip(texts, metas):
+            source = meta.get("source")
+            if source:
+                existing = collection.get(where={"source": source})
+                if existing and existing["ids"]:
+                    logger.warning(f"Duplikat: '{source}' sudah ada di collection, skip. Pakai force=True untuk override.")
+                    continue
+            filtered_texts.append(text)
+            filtered_metas.append(meta)
+
+        if not filtered_texts:
+            logger.warning("Semua dokumen sudah ada di collection. Tidak ada yang di-ingest.")
+            return []
+
+        texts = filtered_texts
+        metas = filtered_metas
+
+    embeddings = get_embeddings(texts)
+    ids = [str(uuid.uuid4()) for _ in texts]
 
     collection.add(
         ids=ids,
@@ -149,6 +195,13 @@ def query_rag(query: str, top_k: int = 3) -> dict:
     query_embedding = get_embeddings([query])[0]
 
     collection = get_chroma_collection()
+
+    if collection.count() == 0:
+        return {
+            "answer": "Belum ada dokumen di collection. Ingest dokumen dulu sebelum query.",
+            "sources": [],
+        }
+
     result = collection.query(
         query_embeddings=[query_embedding],
         n_results=top_k,
@@ -168,9 +221,10 @@ def query_rag(query: str, top_k: int = 3) -> dict:
 
     context_str = "\n\n---\n\n".join(contexts)
     client = get_gemini_client()
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=f"""Based on the following context, answer the question.
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=f"""Based on the following context, answer the question.
 
 Context:
 {context_str}
@@ -178,7 +232,9 @@ Context:
 Question: {query}
 
 Answer:""",
-    )
+        )
+    except Exception as e:
+        raise RuntimeError(f"Gagal generate jawaban via Gemini: {e}")
 
     return {
         "answer": response.text,
