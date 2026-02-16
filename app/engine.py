@@ -46,7 +46,10 @@ def get_chroma_collection() -> chromadb.Collection:
     )
 
 
-def describe_image(file_path: str) -> str:
+DEFAULT_DESCRIBE_PROMPT = "Describe this image for use in a RAG (Retrieval-Augmented Generation) system. Focus on the key information, concepts, and facts presented. Avoid describing visual styling like colors, fonts, or layout. Be concise and informative."
+
+
+def describe_image(file_path: str, prompt: str = None) -> str:
     if not os.path.isfile(file_path):
         raise FileNotFoundError(f"File gambar tidak ditemukan: {file_path}")
 
@@ -64,7 +67,7 @@ def describe_image(file_path: str) -> str:
             contents=[
                 {
                     "parts": [
-                        {"text": "Describe this image for use in a RAG (Retrieval-Augmented Generation) system. Focus on the key information, concepts, and facts presented. Avoid describing visual styling like colors, fonts, or layout. Be concise and informative."},
+                        {"text": prompt or DEFAULT_DESCRIBE_PROMPT},
                         {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(image_bytes).decode()}},
                     ]
                 }
@@ -191,7 +194,17 @@ def ingest_texts(texts: List[str], metadatas: List[dict] = None, force: bool = F
     return ids
 
 
-def query_rag(query: str, top_k: int = 3) -> dict:
+DEFAULT_PROMPT = """Based on the following context, answer the question.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+
+
+def query_rag(query: str, top_k: int = 3, prompt: str = None) -> dict:
     query_embedding = get_embeddings([query])[0]
 
     collection = get_chroma_collection()
@@ -220,18 +233,12 @@ def query_rag(query: str, top_k: int = 3) -> dict:
         })
 
     context_str = "\n\n---\n\n".join(contexts)
+    final_prompt = (prompt or DEFAULT_PROMPT).format(context=context_str, question=query)
     client = get_gemini_client()
     try:
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=f"""Based on the following context, answer the question.
-
-Context:
-{context_str}
-
-Question: {query}
-
-Answer:""",
+            contents=final_prompt,
         )
     except Exception as e:
         raise RuntimeError(f"Gagal generate jawaban via Gemini: {e}")
